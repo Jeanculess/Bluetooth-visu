@@ -1,6 +1,7 @@
 /* Bauhaus Temperature Dashboard
    Arduino IoT Cloud + ThingSpeak + SSD1351 OLED 128x128
    Dual sparklines · Anti-burn · Trend indicators
+   Montreal time (EST5EDT) via NTP with sync-wait
 */
 
 #include "thingProperties.h"
@@ -10,6 +11,7 @@
 #include <Adafruit_SSD1351.h>
 #include <SPI.h>
 #include <time.h>
+#include "esp_sntp.h"
 
 // ── ThingSpeak ───────────────────────────────────────────────────────────────
 const String CHANNEL_ID   = "TON_CHANNEL_ID";
@@ -35,16 +37,41 @@ const String READ_API_KEY = "TA_CLE_API";
 #define RED      0xF800  // Interior accent
 #define CYAN     0x07FF  // Exterior accent
 #define YELLOW   0xFFE0  // Bauhaus separators / title
-#define DARKRED  0x6000  // Interior panel fill  (dark red)
-#define DARKCYAN 0x032C  // Exterior panel fill  (dark teal)
+#define DARKRED  0x6000  // Interior panel fill
+#define DARKCYAN 0x032C  // Exterior panel fill
 #define DRKGREY  0x39E7  // Grid lines / axis separator
 
 // ── Timing ───────────────────────────────────────────────────────────────────
 const unsigned long FETCH_INTERVAL = 120000UL;  // 2 min
 const unsigned long SHIFT_INTERVAL =  60000UL;  // 1 min
 
+// Montreal / Eastern timezone – POSIX rule:
+//   EST = UTC-5 (standard)  EDT = UTC-4 (daylight)
+//   Spring forward: 2nd Sunday of March at 02:00
+//   Fall back:      1st Sunday of November at 02:00
+#define TZ_MONTREAL "EST5EDT,M3.2.0/2:00,M11.1.0/2:00"
+
+// NTP servers (fallback chain)
+#define NTP_SERVER1 "pool.ntp.org"
+#define NTP_SERVER2 "time.nist.gov"
+#define NTP_SERVER3 "time.google.com"
+
+// Maximum time (ms) to block in setup() waiting for first NTP sync
+#define NTP_SYNC_TIMEOUT_MS 15000UL
+
 static unsigned long lastFetchTime = 0;
 static unsigned long lastShiftTime = 0;
+
+// ── NTP sync flag (set by SNTP callback, never reset) ────────────────────────
+// `volatile` is sufficient here: on ESP32 Arduino the sketch runs in a single
+// FreeRTOS task and the SNTP callback executes in the same core context, so no
+// multi-core cache coherency issue arises.  The `volatile` qualifier prevents
+// the compiler from caching the flag value in a register across loop iterations.
+static volatile bool ntpSynced = false;
+
+static void ntpSyncCallback(struct timeval* /*tv*/) {
+  ntpSynced = true;
+}
 
 // ── Anti-burn offset (±1 px, applied to text & data only) ───────────────────
 static int ox = 0, oy = 0;
@@ -59,10 +86,8 @@ static int    historyCount = 0;
 Adafruit_SSD1351 tft(SCREEN_W, SCREEN_H, CS_PIN, DC_PIN, MOSI_PIN, SCLK_PIN, RST_PIN);
 
 // ── Graph scaling constants ───────────────────────────────────────────────────
-// Minimum temperature range before padding is applied (prevents a flat line)
-#define GRAPH_MIN_RANGE   0.1f
-// Padding added above/below when the measured range is too narrow to display
-#define GRAPH_RANGE_PAD   0.5f
+#define GRAPH_MIN_RANGE 0.1f
+#define GRAPH_RANGE_PAD 0.5f
 
 // ── Forward declarations ─────────────────────────────────────────────────────
 void fetchThingSpeak();
@@ -70,7 +95,7 @@ void drawBauhausDashboard();
 void drawSingleGraph(const float* vals, int count,
                      int x, int y, int w, int h,
                      uint16_t color, const char* label);
-void drawSplashScreen();
+void drawSplashScreen(const char* status);
 
 // ── Format a raw API float string to one decimal place ───────────────────────
 static String formatTemperature(const char* raw) {
@@ -80,18 +105,27 @@ static String formatTemperature(const char* raw) {
   return String(buf);
 }
 
-// ── Build "HH:MM" or "--:--" when NTP is not yet synced ─────────────────────
-static void getTimeString(char* out, size_t len) {
-  time_t now;
-  time(&now);
+// ── Return true only when the system clock carries a valid time ───────────────
+// Uses the ntpSynced flag set by the SNTP callback; falls back to a year check
+// in case the callback fires before we register it (race on fast networks).
+static bool clockIsValid() {
+  if (ntpSynced) return true;
+  time_t now = time(nullptr);
   struct tm ti;
   localtime_r(&now, &ti);
-  // tm_year is years since 1900; year 2020 = 120
-  if (ti.tm_year < 120) {
+  return (ti.tm_year >= 120);  // year >= 2020
+}
+
+// ── Build "HH:MM" (Montreal local time) or "--:--" while unsynced ────────────
+static void getTimeString(char* out, size_t len) {
+  if (!clockIsValid()) {
     strlcpy(out, "--:--", len);
-  } else {
-    strftime(out, len, "%H:%M", &ti);
+    return;
   }
+  time_t now = time(nullptr);
+  struct tm ti;
+  localtime_r(&now, &ti);
+  strftime(out, len, "%H:%M", &ti);
 }
 
 // ── Trend character: '^' rising · 'v' falling · '-' flat ────────────────────
@@ -113,26 +147,53 @@ void setup() {
   Serial.begin(9600);
   delay(1500);
 
+  tft.begin();
+  tft.fillScreen(BLACK);
+  drawSplashScreen("Connecting...");
+
   initProperties();
   ArduinoCloud.begin(ArduinoIoTPreferredConnection);
   setDebugMessageLevel(2);
   ArduinoCloud.printDebugInfo();
 
-  tft.begin();
-  tft.fillScreen(BLACK);
-  drawSplashScreen();
+  // Register NTP sync callback BEFORE starting NTP so we never miss the event.
+  sntp_set_time_sync_notification_cb(ntpSyncCallback);
 
-  // configTzTime links NTP + POSIX timezone in a single call (ESP32 Arduino >=1.0.4).
-  // This prevents the SNTP sync callback from silently resetting the timezone to UTC.
-  configTzTime("EST5EDT,M3.2.0,M11.1.0", "pool.ntp.org", "time.nist.gov");
+  // configTzTime sets the POSIX timezone AND starts the SNTP client in one call.
+  // Using TZ_MONTREAL ensures every subsequent localtime_r() call returns
+  // Montreal local time, including the correct EDT/EST offset automatically.
+  configTzTime(TZ_MONTREAL, NTP_SERVER1, NTP_SERVER2, NTP_SERVER3);
+
+  // Block until NTP syncs (or timeout), updating the splash status each second.
+  unsigned long waitStart = millis();
+  while (!ntpSynced && (millis() - waitStart < NTP_SYNC_TIMEOUT_MS)) {
+    // Show elapsed seconds so the user knows the device is alive
+    char status[20];
+    snprintf(status, sizeof(status), "NTP sync %lu s...",
+             (millis() - waitStart) / 1000UL);
+    drawSplashScreen(status);
+    delay(1000);
+  }
+
+  if (ntpSynced) {
+    drawSplashScreen("Time synced!");
+  } else {
+    drawSplashScreen("No NTP – retrying");
+  }
+  delay(800);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
 void loop() {
   ArduinoCloud.update();
 
-  // Anti-burn: shift text/data ±1 px every SHIFT_INTERVAL ms
+  // Anti-burn: shift text/data ±1 px every SHIFT_INTERVAL ms.
+  // Also re-assert the Montreal timezone here to guard against the ESP-IDF SNTP
+  // layer silently resetting the TZ environment variable to UTC on periodic
+  // re-syncs.  Once per minute is more than sufficient.
   if (millis() - lastShiftTime > SHIFT_INTERVAL) {
+    setenv("TZ", TZ_MONTREAL, 1);
+    tzset();
     ox = random(-1, 2);
     oy = random(-1, 2);
     lastShiftTime = millis();
@@ -148,18 +209,19 @@ void loop() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-void drawSplashScreen() {
-  tft.fillRect(4, 40, 120, 48, YELLOW);
+void drawSplashScreen(const char* status) {
+  tft.fillScreen(BLACK);
+  tft.fillRect(4, 30, 120, 48, YELLOW);
   tft.setTextColor(BLACK);
   tft.setTextSize(2);
-  tft.setCursor(10, 48);
+  tft.setCursor(10, 38);
   tft.print("BAUHAUS");
   tft.setTextSize(1);
-  tft.setCursor(14, 68);
+  tft.setCursor(14, 58);
   tft.print("TEMP DASHBOARD");
   tft.setTextColor(DRKGREY);
-  tft.setCursor(20, 96);
-  tft.print("Connecting...");
+  tft.setCursor(4, 90);
+  tft.print(status);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -210,7 +272,6 @@ void drawBauhausDashboard() {
   getTimeString(timeStr, sizeof(timeStr));
 
   // ── HEADER  (Y 0..12) ──────────────────────────────────────────────────────
-  // "BAUHAUS TEMP" = 12 chars x 6 px = 72 px  |  "HH:MM" = 5 chars at X=92
   tft.setTextSize(1);
   tft.setTextColor(YELLOW);
   tft.setCursor(2 + ox, 2 + oy);
@@ -218,14 +279,10 @@ void drawBauhausDashboard() {
   tft.setTextColor(WHITE);
   tft.setCursor(92 + ox, 2 + oy);
   tft.print(timeStr);
-  // Full-width accent bar: no ox/oy so it always spans the entire screen
+  // Full-width accent bar – structural, no anti-burn offset
   tft.fillRect(0, 11, SCREEN_W, 2, YELLOW);
 
   // ── VALUE PANELS  (Y 14..37) ───────────────────────────────────────────────
-  //   Left  (X   0..62) = Interior
-  //   Right (X  65..127) = Exterior
-  // Panel fills/borders are structural (no ox/oy); only text & indicators shift.
-
   // Interior panel
   tft.fillRect(0,  14, 63, 24, DARKRED);
   tft.drawRect(0,  14, 63, 24, RED);
@@ -282,7 +339,7 @@ void drawSingleGraph(const float* vals, int count,
   if (maxVal - minVal < GRAPH_MIN_RANGE) { maxVal += GRAPH_RANGE_PAD; minVal -= GRAPH_RANGE_PAD; }
   const float range = maxVal - minVal;
 
-  // Y-axis integer labels (no "°C" suffix – keeps them within the 0..18 px column)
+  // Y-axis integer labels
   tft.setTextSize(1);
   tft.setTextColor(color);
   tft.setCursor(0 + ox, y + oy);
@@ -290,19 +347,19 @@ void drawSingleGraph(const float* vals, int count,
   tft.setCursor(0 + ox, y + h - 8 + oy);
   tft.print((int)round(minVal));
 
-  // Y-axis separator line and graph border: structural elements, no ox/oy
+  // Y-axis separator line and graph border: structural, no anti-burn offset
   tft.drawLine(19, y, 19, y + h - 1, DRKGREY);
   tft.drawRect(x, y, w, h, WHITE);
 
   // Mid-line grid
   tft.drawLine(x, y + h / 2, x + w - 1, y + h / 2, DRKGREY);
 
-  // Section label inside top-left corner of box (shifts with anti-burn)
+  // Section label (shifts with anti-burn)
   tft.setTextColor(color);
   tft.setCursor(x + 2 + ox, y + 2 + oy);
   tft.print(label);
 
-  // Data lines (double-pixel for readability on a small display)
+  // Data lines (double-pixel for readability on small displays)
   for (int i = 0; i < count - 1; i++) {
     int x1 = x + (int)(i       * (w - 1) / (float)(count - 1));
     int x2 = x + (int)((i + 1) * (w - 1) / (float)(count - 1));
